@@ -1,0 +1,20 @@
+{
+  "name": "wa-bot-sheets",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WhatsApp bot (Evolution API) + Google Sheets (stock + config) with simple rules and CRUD",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "lint": "echo \"(no linter configured)\""
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "googleapis": "^131.0.0",
+    "mustache": "^4.2.0",
+    "pino": "^9.3.2"
+  }
+}
