@@ -7,7 +7,7 @@ const { readBotConfig } = require('../sheets/config');
 
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-// --------------- helpers de texto ---------------
+// --------------- helpers ---------------
 function isGreeting(text='') {
   const t = text.toLowerCase().trim();
   return /^(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)\b/.test(t);
@@ -16,19 +16,16 @@ function includesWord(text='', word='') {
   return (` ${text.toLowerCase()} `).includes(` ${word.toLowerCase()} `);
 }
 
-// --------------- tools (definiciones) ---------------
+// --------------- tools ---------------
 const TOOL_DEFS = {
   search_products: {
     type: "function",
     function: {
       name: "search_products",
-      description: "Buscar productos por texto y/o categoría. Devuelve lista con nombre, precio, stock, imagen.",
+      description: "Buscar productos por texto y/o categoría.",
       parameters: {
         type: "object",
-        properties: {
-          query: { type: "string" },
-          category: { type: "string" }
-        }
+        properties: { query: { type: "string" }, category: { type: "string" } }
       }
     }
   },
@@ -36,7 +33,7 @@ const TOOL_DEFS = {
     type: "function",
     function: {
       name: "check_availability",
-      description: "Chequear disponibilidad (agenda) para fecha/hora/personas.",
+      description: "Chequear disponibilidad (agenda).",
       parameters: {
         type: "object",
         properties: { date:{type:"string"}, time:{type:"string"}, people:{type:"number"} },
@@ -58,16 +55,10 @@ const TOOL_DEFS = {
   }
 };
 
-// Construye el set de herramientas según el rol
 function buildToolsByRole(role) {
   const r = (role || 'mixto').toLowerCase();
-  if (r === 'ventas') {
-    return [TOOL_DEFS.search_products];
-  }
-  if (r === 'reservas') {
-    return [TOOL_DEFS.check_availability, TOOL_DEFS.create_reservation];
-  }
-  // mixto
+  if (r === 'ventas') return [TOOL_DEFS.search_products];
+  if (r === 'reservas') return [TOOL_DEFS.check_availability, TOOL_DEFS.create_reservation];
   return [TOOL_DEFS.search_products, TOOL_DEFS.check_availability, TOOL_DEFS.create_reservation];
 }
 
@@ -92,41 +83,13 @@ async function toolRouter(name, args, ctx) {
       ctx.session.reservation = { ...args, id: out.id, status: out.status };
       return { ok: true, reservation: ctx.session.reservation };
     }
-    default:
-      return { ok: false, error: 'unknown_tool' };
+    default: return { ok: false, error: 'unknown_tool' };
   }
 }
 
 // --------------- prompts ---------------
-function businessPolicyText(cfg, role) {
-  const hours = typeof cfg.business_hours === 'object' ? JSON.stringify(cfg.business_hours) : String(cfg.business_hours || '');
-  const base = [
-    `Horario: ${hours || 'no especificado'}.`,
-    `Zona horaria: ${cfg.timezone || 'America/Argentina/Cordoba'}.`,
-    `No vendes ni cobrás; si piden comprar, derivás al e-commerce (${cfg.ecommerce_url || 'sin URL'}).`,
-  ];
-  if (role === 'ventas') {
-    base.push(
-      `Tu foco: responder sobre productos (precio, stock, detalles).`,
-      `No ofrezcas reservas; si preguntan por turnos, indicá que solo asesorás en productos y derivá al canal de reservas si existe.`
-    );
-  } else if (role === 'reservas') {
-    base.push(
-      `Tu foco: disponibilidad y reservas.`,
-      `No hables de precios/stock de productos; si consultan por productos, aclarar que sos agente de reservas y ofrecer derivar al canal de ventas.`
-    );
-  } else {
-    base.push(
-      `Tu foco: productos y reservas. Si falta información (producto, fecha/hora/personas), pedí aclaraciones.`
-    );
-  }
-  base.push(`Si piden stock sin producto, pedí el producto o la categoría (ej.: "empanizado").`);
-  return base.join(' ');
-}
-
 function buildNLUPrompt({ text, cfg, role }) {
   const categories = cfg.categories ? Object.keys(cfg.categories).join(', ') : '';
-  // Permitimos que el NLU clasifique saludos, consulta de producto o de reserva:
   return `Responde solo JSON con {"intent":"...","product_category":"","product_query":"","confidence":0..1}.
 - intent ∈ {"consulta_stock","reserva","saludo","fallback"}
 - product_category ∈ {${categories}} o ""
@@ -135,17 +98,16 @@ Texto: """${text}"""
 Rol del agente: ${role}`;
 }
 
-// --------------- agente principal ---------------
+// --------------- agente ---------------
 async function runAgent({ userCtx, session, text, viewMode }) {
   if (!process.env.OPENAI_API_KEY) return null;
 
   const cfg = await readBotConfig();
-  const role = (cfg.agent_role || 'mixto').toLowerCase(); // ventas | reservas | mixto
+  const role = (cfg.agent_role || 'mixto').toLowerCase();
   const tools = buildToolsByRole(role);
-
   const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // Saludo rápido sin pedir tools
+  // Saludo rápido
   if (isGreeting(text)) {
     const msg = (cfg.greeting_template || 'Hola').replace('{{bot_name}}', cfg.bot_name || 'Bot');
     return { text: msg, session };
@@ -171,22 +133,19 @@ async function runAgent({ userCtx, session, text, viewMode }) {
   if (intent === 'fallback' && isGreeting(text)) intent = 'saludo';
   const mode = ((viewMode || cfg.response_mode || 'concise') + '').toLowerCase();
 
-  // Guardrails por rol
   const wantsProducts = intent === 'consulta_stock' || /precio|stock|producto|milanesa|bife|vacio|empanizado/i.test(text);
   const wantsReservation = intent === 'reserva' || /reserva|turno|disponibilidad|agenda/i.test(text);
 
-  
-  // --- RESCATE EN FALLBACK: si parece consulta de productos, busquemos igual ---
+  // --- Rescate en fallback ---
   if (intent === 'fallback') {
     const seemsProduct = wantsProducts || /milanesa|milanesas|bife|vac(i|í)o|empanizado|empanizados|precio|stock|cat[aá]logo/i.test(text);
     if (seemsProduct) {
-      const q = (product_query && product_query.trim()) ? product_query : text;
+      logger.info({ text }, 'Fallback rescue activado');
       try {
-        const list = await findProducts(q, (product_category || '').trim() || undefined);
+        const list = await findProducts(product_query, product_category);
         if (list && list.length) {
           const p = list[0];
           const oos = (p.qty_available || 0) <= 0;
-          const cfg = await readBotConfig();
           const line = oos
             ? (cfg.oos_template || 'No lo tengo ahora mismo.').replace('{{product}}', p.name)
             : `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
@@ -201,11 +160,13 @@ async function runAgent({ userCtx, session, text, viewMode }) {
       }
     }
   }
-if (role === 'ventas' && wantsReservation) {
-    return { text: "Soy agente de ventas. Para reservas, decime fecha/hora/personas y te derivo, o escribime por el canal de reservas.", session };
+
+  // Guardrails
+  if (role === 'ventas' && wantsReservation) {
+    return { text: "Soy agente de ventas. Para reservas, decime fecha/hora/personas y te derivo.", session };
   }
   if (role === 'reservas' && wantsProducts) {
-    return { text: "Soy agente de reservas. Para precios o stock, te puedo derivar con ventas o contame la fecha/hora que te interesan y reviso disponibilidad.", session };
+    return { text: "Soy agente de reservas. Para precios o stock, te puedo derivar con ventas.", session };
   }
 
   // —— INTENTS —— //
@@ -215,89 +176,42 @@ if (role === 'ventas' && wantsReservation) {
   }
 
   if (intent === 'consulta_stock' && role !== 'reservas') {
-    // productos
     const list = (await toolRouter('search_products', { query: product_query, category: product_category }, { session })).results || [];
-
-    // Si no hubo matches con stock, intentemos precio del mencionado
     const all = await readStock();
 
-    // ¿Mención explícita de milanesa u otro?
+    // match “milanesa” literal
     const lowerText = text.toLowerCase();
-    // ejemplo puntual para milanesa (podés expandir si querés)
     const exactMention = all.find(p =>
       (includesWord(lowerText, 'milanesa') || includesWord(lowerText, 'milanesas')) &&
       p.name.toLowerCase().includes('milanesa')
     );
-
     if (exactMention) {
       const p = exactMention;
       const priceLine = `${p.name}${p.variant ? ` (${p.variant})` : ''} está a $${p.price}${p.qty_available>0?` | Stock: ${p.qty_available}`:' | ahora sin stock'}.`;
-      if (mode === 'rich' && p.image_url) {
-        return {
-          text: priceLine + ' ¿Querés que te recomiende algo similar?',
-          session,
-          rich: { image_url: p.image_url, caption: priceLine }
-        };
-      }
-      return { text: priceLine + ' ¿Querés que te recomiende algo similar?', session };
+      return { text: priceLine, session };
     }
 
-    // Categoría genérica (“empanizado”)
     if (product_category) {
       const withStock = list.filter(x => x.qty_available > 0);
       if (withStock.length) {
         const top = withStock[0];
-        if (mode === 'rich' && top.image_url) {
-          const caption = `${top.name}${top.variant?` (${top.variant})`:''} — $${top.price} | Stock: ${top.qty_available}`;
-          const lines = withStock.slice(0,3).map(x => `• ${x.name}${x.variant?` (${x.variant})`:''}: $${x.price} ${x.qty_available>0?`(stock ${x.qty_available})`:'(sin stock)'}`).join('\n');
-          return { text: `Sí, tenemos ${product_category}.\n${lines}\n\n¿Querés otra opción?`, session, rich: { image_url: top.image_url, caption } };
-        }
-        const line = `${top.name}${top.variant?` (${top.variant})`:''} a $${top.price} (stock ${top.qty_available}).`;
-        return { text: `Sí, tenemos ${product_category}. Por ejemplo: ${line}`, session };
+        return { text: `Sí, tenemos ${product_category}: ${top.name} — $${top.price} (stock ${top.qty_available})`, session };
       }
-
-      // No hay stock en la categoría → mostrar precio de algo sin stock si existe
-      const outOfStockInCat = all.filter(p => (p.categories || '').includes(product_category));
-      if (outOfStockInCat.length) {
-        const p = outOfStockInCat[0];
-        const msg = `${p.name}${p.variant?` (${p.variant})`:''} está a $${p.price}, pero ahora sin stock. ¿Te sugiero algo similar o te aviso cuando repongamos?`;
-        if (mode === 'rich' && p.image_url) {
-          return { text: msg, session, rich: { image_url: p.image_url, caption: `${p.name}${p.variant?` (${p.variant})`:''} — $${p.price} | sin stock` } };
-        }
-        return { text: msg, session };
-      }
-
-      return { text: `No encontré productos en la categoría ${product_category}. ¿Querés buscar por nombre?`, session };
     }
 
-    // Sin categoría explícita: usa la mejor coincidencia
     if (list.length) {
       const top = list[0];
-      const sufStock = top.qty_available>0 ? ` | Stock: ${top.qty_available}` : ' | ahora sin stock';
-      if (mode === 'rich' && top.image_url) {
-        return {
-          text: `${top.name}${top.variant?` (${top.variant})`:''} — $${top.price}${sufStock}. ¿Querés más opciones?`,
-          session,
-          rich: { image_url: top.image_url, caption: `${top.name}${top.variant?` (${top.variant})`:''} — $${top.price}${sufStock}` }
-        };
-      }
-      return { text: `${top.name}${top.variant?` (${top.variant})`:''} — $${top.price}${sufStock}. ¿Querés más opciones?`, session };
+      return { text: `${top.name} — $${top.price} | Stock: ${top.qty_available}`, session };
     }
 
-    return { text: "No encontré ese producto. ¿Querés que busque por otra palabra o te sugiera alternativas?", session };
+    return { text: "No encontré ese producto. ¿Querés otra palabra o alternativa?", session };
   }
 
   if (intent === 'reserva' && role !== 'ventas') {
-    // reservas
-    // Pedir datos si faltan
-    if (!/(\d{4}-\d{2}-\d{2}).*(\d{2}:\d{2}).*(\d+)/.test(text)) {
-      return { text: "Confirmame fecha (YYYY-MM-DD), hora (HH:mm) y cuántas personas, y lo reviso.", session };
-    }
-    // Nota: podrías parsear y llamar a check_availability/create_reservation automáticamente.
-    return { text: "Perfecto. Pasame fecha (YYYY-MM-DD), hora (HH:mm) y cantidad de personas para verificar disponibilidad.", session };
+    return { text: "Confirmame fecha (YYYY-MM-DD), hora (HH:mm) y cuántas personas, y lo reviso.", session };
   }
 
-  // fallback elegante según rol
+  // fallback elegante
   if (role === 'ventas') {
     return { text: "¿Sobre qué producto te ayudo? Podés pedir por categoría (ej.: empanizados) o por nombre (ej.: milanesa).", session };
   }
