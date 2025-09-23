@@ -3,6 +3,8 @@ const { readBotConfig } = require('../sheets/config');
 const { findProducts } = require('../sheets/stock');
 const { sendText, sendMedia } = require('../evo');
 const { logger } = require('../utils/logger');
+const { getSession, saveSession } = require('../memory/store');
+const { runAgent } = require('../nlu/agent');
 
 // --------- utilidades NLU / normalización ----------
 function normalizeQuery(q, synonyms = {}) {
@@ -75,6 +77,32 @@ async function handleIncoming(ev) {
     }
 
     const cfg = await readBotConfig();
+    const session = await getSession(from);
+
+    // 1) Contexto para el agente
+    const userCtx = {
+      tz: cfg.timezone || 'America/Argentina/Cordoba',
+      last_product: session.last_product || null
+    };
+
+    // 2) Agente (ChatGPT + tools). Si no hay OPENAI_API_KEY → null
+    const agentOut = await runAgent({ userCtx, session, text });
+
+    if (agentOut && agentOut.text) {
+      // responder y persistir memoria
+      await sendText(from, agentOut.text);
+
+      // guardar historial de conversación
+      const newHistory = (session.history || []).concat([
+        { role: 'user', content: text },
+        { role: 'assistant', content: agentOut.text }
+      ]);
+      const merged = { ...(agentOut.session || session), history: newHistory };
+      await saveSession(from, merged);
+      return;
+    }
+
+    // 3) Fallback básico (keywords → stock)
     const qNorm = normalizeQuery(text, cfg.synonyms);
     const intent = detectIntent(qNorm, cfg.intents);
 
@@ -83,19 +111,17 @@ async function handleIncoming(ev) {
       if (items && items.length) {
         const p = items[0];
         const line = `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
-        if (p.image_url) {
-          await sendMedia(from, p.image_url, line);
-        } else {
-          await sendText(from, line);
-        }
+        session.last_product = p.name;
+        await saveSession(from, session);
+        if (p.image_url) await sendMedia(from, p.image_url, line);
+        else await sendText(from, line);
         return;
       }
-      const msg = (cfg.oos_template || 'No lo tengo ahora.').replace('{{product}}', qNorm || '');
-      await sendText(from, msg);
+      await sendText(from, "¿Sobre qué producto querés consultar el stock? (ej.: bife, vacío, milanesa)");
       return;
     }
 
-    // Fallback / saludo
+    // 4) Saludo por defecto
     const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
     await sendText(from, msg);
   } catch (err) {
