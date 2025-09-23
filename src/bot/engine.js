@@ -118,8 +118,11 @@ async function handleIncoming(ev) {
     const agentOut = await runAgent({ userCtx, session, text, viewMode: viewModeOverride });
 
     if (agentOut && agentOut.text) {
+      const generic = /¿Sobre qué producto o reserva te ayudo\?/i.test(agentOut.text);
       const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
-      await sendText(from, agentOut.text);
+      if (!generic) {
+        await sendText(from, agentOut.text);
+      }
       if (mode === 'rich' && agentOut.rich?.image_url) {
         await sendMedia(from, agentOut.rich.image_url, agentOut.rich.caption || '');
       }

@@ -175,7 +175,33 @@ async function runAgent({ userCtx, session, text, viewMode }) {
   const wantsProducts = intent === 'consulta_stock' || /precio|stock|producto|milanesa|bife|vacio|empanizado/i.test(text);
   const wantsReservation = intent === 'reserva' || /reserva|turno|disponibilidad|agenda/i.test(text);
 
-  if (role === 'ventas' && wantsReservation) {
+  
+  // --- RESCATE EN FALLBACK: si parece consulta de productos, busquemos igual ---
+  if (intent === 'fallback') {
+    const seemsProduct = wantsProducts || /milanesa|milanesas|bife|vac(i|í)o|empanizado|empanizados|precio|stock|cat[aá]logo/i.test(text);
+    if (seemsProduct) {
+      const q = (product_query && product_query.trim()) ? product_query : text;
+      try {
+        const list = await findProducts(q, (product_category || '').trim() || undefined);
+        if (list && list.length) {
+          const p = list[0];
+          const oos = (p.qty_available || 0) <= 0;
+          const cfg = await readBotConfig();
+          const line = oos
+            ? (cfg.oos_template || 'No lo tengo ahora mismo.').replace('{{product}}', p.name)
+            : `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
+          return {
+            text: line,
+            session: { ...session, last_product: p.name },
+            rich: (!oos && p.image_url) ? { image_url: p.image_url, caption: `${p.name} — $${p.price}` } : undefined
+          };
+        }
+      } catch (e) {
+        logger.warn({ e }, 'fallback rescue failed');
+      }
+    }
+  }
+if (role === 'ventas' && wantsReservation) {
     return { text: "Soy agente de ventas. Para reservas, decime fecha/hora/personas y te derivo, o escribime por el canal de reservas.", session };
   }
   if (role === 'reservas' && wantsProducts) {
