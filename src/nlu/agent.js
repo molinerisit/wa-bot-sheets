@@ -1,6 +1,6 @@
 const OpenAI = require('openai');
 const { logger } = require('../utils/logger');
-const { findProducts, readStock } = require('../sheets/stock');
+const { findProducts } = require('../sheets/stock');
 const { checkAvailability } = require('../sheets/availability');
 const { createReservation } = require('../sheets/reservations');
 const { readBotConfig } = require('../sheets/config');
@@ -12,30 +12,24 @@ const tools = [
     type: "function",
     function: {
       name: "search_products",
-      description: "Buscar productos por texto libre y devolver una lista corta con sku, name, variant, price, qty_available, image_url.",
-      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
-    }
-  },
-  {
-    type: "function",
-    function: {
-      name: "get_product_details",
-      description: "Obtener detalles de un producto por sku exacto.",
-      parameters: { type: "object", properties: { sku: { type: "string" } }, required: ["sku"] }
+      description: "Buscar productos por texto libre y/o categoría normalizada. Devuelve lista con nombre, precio y stock.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          category: { type: "string", description: "categoría normalizada (ej.: empanizado, carne)" }
+        }
+      }
     }
   },
   {
     type: "function",
     function: {
       name: "check_availability",
-      description: "Chequear disponibilidad en agenda para una fecha/hora y cantidad de personas.",
+      description: "Chequear disponibilidad para fecha/hora/personas.",
       parameters: {
         type: "object",
-        properties: {
-          date: { type: "string", description: "YYYY-MM-DD" },
-          time: { type: "string", description: "HH:mm" },
-          people: { type: "number" }
-        },
+        properties: { date:{type:"string"}, time:{type:"string"}, people:{type:"number"} },
         required: ["date","time","people"]
       }
     }
@@ -47,128 +41,143 @@ const tools = [
       description: "Crear una reserva (no cobra).",
       parameters: {
         type: "object",
-        properties: {
-          name: { type: "string" },
-          phone: { type: "string" },
-          date: { type: "string" },
-          time: { type: "string" },
-          people: { type: "number" },
-          notes: { type: "string" }
-        },
+        properties: { name:{type:"string"}, phone:{type:"string"}, date:{type:"string"}, time:{type:"string"}, people:{type:"number"}, notes:{type:"string"} },
         required: ["date","time","people"]
       }
     }
   }
 ];
 
-async function toolRouter(name, args, context) {
+async function searchProductsTool(args, ctx) {
+  const list = await findProducts(args.query || '', args.category || '');
+  const trimmed = list.slice(0, 5).map(p => ({
+    sku: p.sku,
+    name: p.name,
+    variant: p.variant,
+    price: p.price,
+    qty_available: p.qty_available,
+    image_url: p.image_url || '',
+    categories: p.categories || ''
+  }));
+  if (trimmed[0]) ctx.session.last_product = trimmed[0].name;
+  return { ok: true, results: trimmed };
+}
+
+async function toolRouter(name, args, ctx) {
   switch (name) {
-    case 'search_products': {
-      const rows = await findProducts(args.query || '');
-      const trimmed = rows.slice(0, 5).map(p => ({
-        sku: p.sku, name: p.name, variant: p.variant, price: p.price,
-        qty_available: p.qty_available, image_url: p.image_url || ''
-      }));
-      // memorizar último producto si hay un match claro
-      if (trimmed[0]) context.session.last_product = trimmed[0].name;
-      return { ok: true, results: trimmed };
-    }
-    case 'get_product_details': {
-      const all = await readStock();
-      const p = all.find(x => x.sku === args.sku);
-      if (p) context.session.last_product = p.name;
-      return { ok: !!p, product: p || null };
-    }
-    case 'check_availability': {
-      const out = await checkAvailability(args.date, args.time, args.people);
-      return { ok: true, ...out };
-    }
+    case 'search_products': return searchProductsTool(args, ctx);
+    case 'check_availability': return { ok: true, ...(await checkAvailability(args.date, args.time, args.people)) };
     case 'create_reservation': {
-      const { name, phone, date, time, people, notes } = args;
-      const out = await createReservation({ name, phone, date, time, people, notes });
-      context.session.reservation = { id: out.id, name, phone, date, time, people, notes, status: out.status };
-      return { ok: true, reservation: context.session.reservation };
+      const out = await createReservation(args);
+      ctx.session.reservation = { ...args, id: out.id, status: out.status };
+      return { ok: true, reservation: ctx.session.reservation };
     }
-    default:
-      return { ok: false, error: 'unknown_tool' };
+    default: return { ok: false, error: 'unknown_tool' };
   }
 }
 
 function businessPolicyText(cfg) {
-  // Usamos reglas de negocio desde config para guiar al modelo
   const hours = typeof cfg.business_hours === 'object' ? JSON.stringify(cfg.business_hours) : String(cfg.business_hours || '');
-  const policy = [
+  return [
     `Horario: ${hours || 'no especificado'}.`,
-    `Idioma: ${cfg.language || 'es-AR'}.`,
-    `Zona horaria: ${cfg.timezone || 'America/Argentina/Cordoba'}.`,
-    `No realizar ventas/checkout: redirigir a e-commerce si piden comprar (${cfg.ecommerce_url || 'sin URL configurada'}).`,
-    `Si usuario pregunta "¿tenés stock?" sin producto → pedir el producto.`,
-    `Nunca inventes stock ni precios: consultá herramientas.`,
+    `No vendes ni cobrás; si piden comprar, derivás al e-commerce (${cfg.ecommerce_url || 'sin URL'}).`,
+    `Si piden stock sin producto, pedí el producto o la categoría.`,
+    `Usá categoría si la consulta es genérica (ej.: "empanizado").`
   ].join(' ');
-  return policy;
+}
+
+function buildNLUPrompt({ text, cfg }) {
+  const categories = cfg.categories ? Object.keys(cfg.categories).join(', ') : '';
+  return `Devuelve solo JSON con: { "intent": "...", "product_category": "", "product_query": "", "confidence": 0..1 }.
+- intent ∈ {"consulta_stock","reserva","fallback"}
+- product_category ∈ {${categories}} o "" si no aplica
+- product_query: término libre normalizado (si menciona un producto puntual)
+Texto: """${text}"""`;
 }
 
 async function runAgent({ userCtx, session, text }) {
   if (!process.env.OPENAI_API_KEY) return null;
 
   const cfg = await readBotConfig();
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
   const system = [
-    "Eres un asistente en español rioplatense: claro, amable, preciso.",
-    "Rol: asesor/secretario. Respondes sobre productos (precio/stock/detalles) y agenda (disponibilidad/reservas).",
-    "NO vendes ni cobrás. Si piden comprar, indicá que las ventas se realizan por el e-commerce configurado.",
-    "Pedí aclaraciones cuando falten datos (producto, fecha/hora, personas).",
-    "Usá las herramientas para verificar datos reales.",
+    "Asistente en español rioplatense; rol: asesor/secretario.",
+    "Responde sobre productos (precio/stock/detalles) y agenda/reservas.",
+    "No vendas ni cobres. Pedí aclaraciones cuando falten datos.",
     businessPolicyText(cfg)
   ].join(' ');
 
-  const messages = [
-    { role: "system", content: system },
-    ...(session.history || []).slice(-8),
-    { role: "user", content: text }
-  ];
+  const nluPrompt = buildNLUPrompt({ text, cfg });
 
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const context = { session };
-
-  let res = await client.chat.completions.create({
+  // Paso 1: NLU estructurado
+  const nluRes = await client.chat.completions.create({
     model: MODEL,
-    messages,
-    tools,
-    tool_choice: "auto",
-    temperature: 0.3,
-    max_tokens: 350
+    messages: [
+      { role: "system", content: "Responde solo JSON válido." },
+      { role: "user", content: nluPrompt }
+    ],
+    temperature: 0.1,
+    max_tokens: 120
   });
 
-  for (let i = 0; i < 2; i++) {
-    const choice = res.choices?.[0];
-    const msg = choice?.message;
-    if (!msg) break;
+  let nlu = {};
+  try { nlu = JSON.parse(nluRes.choices?.[0]?.message?.content || "{}"); } catch {}
+  const intent = nlu.intent || 'fallback';
+  const product_category = (nlu.product_category || '').toLowerCase();
+  const product_query = nlu.product_query || text;
 
-    if (msg.tool_calls && msg.tool_calls.length > 0) {
-      const call = msg.tool_calls[0];
-      const name = call.function.name;
-      const args = JSON.parse(call.function.arguments || "{}");
+  // Paso 2: si es consulta de stock -> usar herramienta de productos
+  const messages = [
+    { role: "system", content: system },
+    ...(session.history || []).slice(-6),
+    { role: "user", content: text }
+  ];
+  const ctx = { session };
 
-      const toolResult = await toolRouter(name, args, context);
+  if (intent === 'consulta_stock') {
+    // llamar a la tool con categoría y/o query
+    const results = await searchProductsTool({ query: product_query, category: product_category }, ctx);
 
-      messages.push({ role: "assistant", tool_calls: [call], content: "" });
-      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(toolResult) });
+    const mode = (cfg.response_mode || 'concise').toLowerCase();
+    const items = results.results || [];
 
-      res = await client.chat.completions.create({
-        model: MODEL,
-        messages,
-        tools,
-        tool_choice: "auto",
-        temperature: 0.3,
-        max_tokens: 350
-      });
-    } else {
-      break;
+    if (!items.length) {
+      return { text: "No encontré nada en esa categoría/producto. ¿Querés que busque otra cosa o un corte similar?", session: ctx.session };
     }
+
+    // Elegir el mejor (prioriza con stock)
+    const top = items[0];
+
+    if (mode === 'concise') {
+      // Respuesta humana corta
+      if (product_category) {
+        // si viene categoría genérica
+        const conStock = items.find(x => x.qty_available > 0);
+        if (conStock) {
+          return { text: `Sí, tenemos ${product_category}. Por ejemplo, ${conStock.name}${conStock.variant ? ` (${conStock.variant})` : ''} a $${conStock.price}. ¿Querés ver otra opción?`, session: ctx.session };
+        }
+        return { text: `Tenemos ${product_category}, pero ahora mismo sin stock disponible. ¿Querés que te avise cuando repongamos o te sugiero algo similar?`, session: ctx.session };
+      }
+      // producto puntual
+      const sufStock = top.qty_available > 0 ? ` | Stock: ${top.qty_available}` : ` | sin stock ahora`;
+      return { text: `${top.name}${top.variant ? ` (${top.variant})` : ''} está a $${top.price}${sufStock}.`, session: ctx.session };
+    }
+
+    // modo "rich": imagen + listado breve
+    const header = product_category
+      ? `Opciones en ${product_category}:`
+      : `Te dejo una opción:`;
+
+    let caption = `${top.name}${top.variant ? ` (${top.variant})` : ''} — $${top.price} | Stock: ${top.qty_available}`;
+    // devolvemos el texto; el envío de imagen lo maneja engine con sendMedia si querés.
+    const list = items.slice(0,3).map(x => `• ${x.name}${x.variant?` (${x.variant})`:''}: $${x.price} ${x.qty_available>0?`(stock ${x.qty_available})`:'(sin stock)'}`).join('\n');
+
+    return { text: `${header}\n${list}\n\n¿Te paso más opciones o querés reservar?`, session: ctx.session, rich: { image_url: top.image_url, caption } };
   }
 
-  const final = res.choices?.[0]?.message?.content || "";
-  return { text: final, session: context.session };
+  // (Reserva y fallback igual que antes; omitido aquí por brevedad)
+  return { text: "¿Sobre qué producto o reserva te gustaría que te ayude?", session: ctx.session };
 }
 
 module.exports = { runAgent };

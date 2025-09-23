@@ -32,7 +32,6 @@ function detectIntent(q, intents = []) {
 
 // --------- extractores robustos para Evolution ---------
 function unwrap(ev) {
-  // Evolution suele mandar { event, instance, data: {...} }
   return ev && ev.data ? ev.data : ev;
 }
 
@@ -47,21 +46,17 @@ function extractTextFromEvolution(ev) {
   const e = unwrap(ev);
   const m = e?.message;
 
-  // 1) String directo
   if (typeof e?.text === 'string') return e.text;
   if (typeof m === 'string') return m;
 
-  // 2) Estructuras típicas WhatsApp
   if (m?.conversation) return m.conversation;
   if (m?.extendedTextMessage?.text) return m.extendedTextMessage.text;
   if (m?.imageMessage?.caption) return m.imageMessage.caption;
   if (m?.videoMessage?.caption) return m.videoMessage.caption;
   if (m?.documentMessage?.caption) return m.documentMessage.caption;
 
-  // 3) Otros formatos vistos (message.text.body)
   if (e?.message?.text?.body) return e.message.text.body;
 
-  // 4) Fallback
   return '';
 }
 
@@ -79,20 +74,27 @@ async function handleIncoming(ev) {
     const cfg = await readBotConfig();
     const session = await getSession(from);
 
-    // 1) Contexto para el agente
+    // Contexto del usuario
     const userCtx = {
       tz: cfg.timezone || 'America/Argentina/Cordoba',
       last_product: session.last_product || null
     };
 
-    // 2) Agente (ChatGPT + tools). Si no hay OPENAI_API_KEY → null
+    // 1) Intentar con el agente (OpenAI + tools)
     const agentOut = await runAgent({ userCtx, session, text });
 
     if (agentOut && agentOut.text) {
-      // responder y persistir memoria
+      const mode = (cfg.response_mode || 'concise').toLowerCase();
+
+      // Enviar texto siempre
       await sendText(from, agentOut.text);
 
-      // guardar historial de conversación
+      // Si hay contenido rich y el modo lo permite → mandar imagen
+      if (mode === 'rich' && agentOut.rich?.image_url) {
+        await sendMedia(from, agentOut.rich.image_url, agentOut.rich.caption || '');
+      }
+
+      // Guardar historial/memoria
       const newHistory = (session.history || []).concat([
         { role: 'user', content: text },
         { role: 'assistant', content: agentOut.text }
@@ -102,7 +104,7 @@ async function handleIncoming(ev) {
       return;
     }
 
-    // 3) Fallback básico (keywords → stock)
+    // 2) Fallback: NLU básico
     const qNorm = normalizeQuery(text, cfg.synonyms);
     const intent = detectIntent(qNorm, cfg.intents);
 
@@ -121,7 +123,7 @@ async function handleIncoming(ev) {
       return;
     }
 
-    // 4) Saludo por defecto
+    // 3) Saludo por defecto
     const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
     await sendText(from, msg);
   } catch (err) {

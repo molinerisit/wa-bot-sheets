@@ -1,43 +1,67 @@
 const { getSheets } = require('./sheets');
 
-const RANGE = 'stock!A:Z';
+function rowToObj(headers, row) {
+  const obj = Object.fromEntries(headers.map((h,i)=>[h, row[i] ?? '']));
+  obj.qty_available = Number(obj.qty_available || 0);
+  obj.price = Number(obj.price || 0);
+  obj.cost = Number(obj.cost || 0);
+  obj.min_qty = Number(obj.min_qty || 0);
+  obj.categories = String(obj.categories || '').toLowerCase();
+  return obj;
+}
 
 async function readStock() {
   const s = getSheets();
-  const res = await s.spreadsheets.values.get({ spreadsheetId: process.env.SPREADSHEET_ID, range: RANGE });
+  const res = await s.spreadsheets.values.get({
+    spreadsheetId: process.env.SPREADSHEET_ID,
+    range: 'stock!A:Z'
+  });
   const values = res.data.values || [];
   const [headers, ...rows] = values;
   if (!headers) return [];
-  return rows.map(r => Object.fromEntries(headers.map((h,i)=>[h, r[i] ?? ''])))
-             .map(x => ({
-               ...x,
-               qty_available: Number(x.qty_available||0),
-               price: Number(x.price||0)
-             }));
+  return rows.map(r => rowToObj(headers, r));
 }
 
-async function findProducts(query) {
-  const q = (query || '').toLowerCase();
-  const items = await readStock();
-  return items
-    .filter(x => (x.status || 'active') !== 'hidden')
-    .filter(x => (`${x.name} ${x.variant||''}`).toLowerCase().includes(q));
+function normalize(text) {
+  return String(text || '').toLowerCase();
 }
 
-async function upsertStockBySku(sku, patch) {
-  const s = getSheets();
-  const all = await readStock();
-  const idx = all.findIndex(x => x.sku === sku);
-  if (idx < 0) throw new Error('SKU no existe');
-  const headers = Object.keys(all[0]);
-  const rowValues = headers.map(h => (patch && h in patch) ? patch[h] : all[idx][h]);
-  const rowNumber = idx + 2; // header = row 1
-  await s.spreadsheets.values.update({
-    spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `stock!A${rowNumber}:${String.fromCharCode(65 + headers.length - 1)}${rowNumber}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [rowValues] }
+function matchesQuery(p, q) {
+  const t = `${p.name} ${p.variant || ''} ${p.categories || ''}`.toLowerCase();
+  return q.split(/\s+/).filter(Boolean).every(w => t.includes(w));
+}
+
+function matchesCategory(p, cat) {
+  if (!cat) return false;
+  const tags = (p.categories || '').split(/[;,|]/).map(x => x.trim());
+  return tags.includes(cat.toLowerCase());
+}
+
+function sortPreferInStock(list) {
+  return list.slice().sort((a,b) => {
+    const aIn = a.qty_available > 0 ? 1 : 0;
+    const bIn = b.qty_available > 0 ? 1 : 0;
+    if (bIn !== aIn) return bIn - aIn; // primero con stock
+    return a.price - b.price;          // luego el más económico
   });
 }
 
-module.exports = { readStock, findProducts, upsertStockBySku };
+async function findProducts(query, normalizedCategory) {
+  const all = await readStock();
+  const q = normalize(query);
+
+  let filtered = all.filter(p => (p.status || 'active') !== 'hidden');
+
+  // Si hay categoría detectada, filtramos por categoría
+  if (normalizedCategory) {
+    const byCat = filtered.filter(p => matchesCategory(p, normalizedCategory));
+    if (byCat.length) return sortPreferInStock(byCat);
+  }
+
+  // Si no, buscamos por texto (nombre/variante/categorías)
+  if (q) filtered = filtered.filter(p => matchesQuery(p, q));
+
+  return sortPreferInStock(filtered);
+}
+
+module.exports = { readStock, findProducts };
