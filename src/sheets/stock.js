@@ -22,45 +22,35 @@ async function readStock() {
   return rows.map(r => rowToObj(headers, r));
 }
 
-function normalize(text) {
-  return String(text || '').toLowerCase();
-}
-
+function normalize(text) { return String(text || '').toLowerCase(); }
 function matchesQuery(p, q) {
   const t = `${p.name} ${p.variant || ''} ${p.categories || ''}`.toLowerCase();
   return q.split(/\s+/).filter(Boolean).every(w => t.includes(w));
 }
-
 function matchesCategory(p, cat) {
   if (!cat) return false;
   const tags = (p.categories || '').split(/[;,|]/).map(x => x.trim());
   return tags.includes(cat.toLowerCase());
 }
-
 function sortPreferInStock(list) {
   return list.slice().sort((a,b) => {
     const aIn = a.qty_available > 0 ? 1 : 0;
     const bIn = b.qty_available > 0 ? 1 : 0;
-    if (bIn !== aIn) return bIn - aIn; // primero con stock
-    return a.price - b.price;          // luego el más económico
+    if (bIn !== aIn) return bIn - aIn;
+    return a.price - b.price;
   });
 }
 
 async function findProducts(query, normalizedCategory) {
   const all = await readStock();
   const q = normalize(query);
-
   let filtered = all.filter(p => (p.status || 'active') !== 'hidden');
 
-  // Si hay categoría detectada, filtramos por categoría
   if (normalizedCategory) {
     const byCat = filtered.filter(p => matchesCategory(p, normalizedCategory));
-    if (byCat.length) return sortPreferInStock(byCat);
+    return sortPreferInStock(byCat);
   }
-
-  // Si no, buscamos por texto (nombre/variante/categorías)
   if (q) filtered = filtered.filter(p => matchesQuery(p, q));
-
   return sortPreferInStock(filtered);
 }
 

@@ -6,7 +6,7 @@ const { logger } = require('../utils/logger');
 const { getSession, saveSession } = require('../memory/store');
 const { runAgent } = require('../nlu/agent');
 
-// --------- utilidades NLU / normalización ----------
+// --------- utilidades ----------
 function normalizeQuery(q, synonyms = {}) {
   const raw = (typeof q === 'string' ? q : '').toLowerCase();
   let out = raw;
@@ -30,10 +30,13 @@ function detectIntent(q, intents = []) {
   return 'fallback';
 }
 
-// --------- extractores robustos para Evolution ---------
-function unwrap(ev) {
-  return ev && ev.data ? ev.data : ev;
+function isGreeting(text = '') {
+  const t = text.toLowerCase().trim();
+  return /^(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)\b/.test(t);
 }
+
+// --------- extractores Evolution ---------
+function unwrap(ev) { return ev && ev.data ? ev.data : ev; }
 
 function extractFromNumber(ev) {
   const e = unwrap(ev);
@@ -45,66 +48,67 @@ function extractFromNumber(ev) {
 function extractTextFromEvolution(ev) {
   const e = unwrap(ev);
   const m = e?.message;
-
   if (typeof e?.text === 'string') return e.text;
   if (typeof m === 'string') return m;
-
   if (m?.conversation) return m.conversation;
   if (m?.extendedTextMessage?.text) return m.extendedTextMessage.text;
   if (m?.imageMessage?.caption) return m.imageMessage.caption;
   if (m?.videoMessage?.caption) return m.videoMessage.caption;
   if (m?.documentMessage?.caption) return m.documentMessage.caption;
-
   if (e?.message?.text?.body) return e.message.text.body;
-
   return '';
 }
 
-// --------- manejador principal ----------
+// quick toggle “fotos”
+function isPhotoRequest(text) {
+  const t = (text || '').toLowerCase();
+  return /mostrame fotos|mandame fotos|mostrar fotos|ver fotos|con fotos|modo catálogo|modo catalogo|catálogo|catalogo/.test(t);
+}
+
+// --------- handler ----------
 async function handleIncoming(ev) {
   try {
     const from = extractFromNumber(ev);
     const text = extractTextFromEvolution(ev);
-
-    if (!from) {
-      logger.warn({ ev }, 'Mensaje sin remitente (from)');
-      return;
-    }
+    if (!from) { logger.warn({ ev }, 'Mensaje sin remitente (from)'); return; }
 
     const cfg = await readBotConfig();
     const session = await getSession(from);
 
-    // Contexto del usuario
+    // Saludos: respondemos saludo “humano”
+    if (isGreeting(text)) {
+      const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
+      await sendText(from, msg);
+      // guardo historia
+      const newHistory = (session.history || []).concat([{ role: 'user', content: text }, { role: 'assistant', content: msg }]);
+      await saveSession(from, { ...session, history: newHistory });
+      return;
+    }
+
+    const viewModeOverride = isPhotoRequest(text) ? 'rich' : null;
+
+    // Contexto para agente
     const userCtx = {
       tz: cfg.timezone || 'America/Argentina/Cordoba',
       last_product: session.last_product || null
     };
 
-    // 1) Intentar con el agente (OpenAI + tools)
-    const agentOut = await runAgent({ userCtx, session, text });
+    // 1) Agente (OpenAI + tools)
+    const agentOut = await runAgent({ userCtx, session, text, viewMode: viewModeOverride });
 
     if (agentOut && agentOut.text) {
-      const mode = (cfg.response_mode || 'concise').toLowerCase();
-
-      // Enviar texto siempre
+      const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
       await sendText(from, agentOut.text);
-
-      // Si hay contenido rich y el modo lo permite → mandar imagen
       if (mode === 'rich' && agentOut.rich?.image_url) {
         await sendMedia(from, agentOut.rich.image_url, agentOut.rich.caption || '');
       }
-
-      // Guardar historial/memoria
-      const newHistory = (session.history || []).concat([
-        { role: 'user', content: text },
-        { role: 'assistant', content: agentOut.text }
-      ]);
+      const newHistory = (session.history || []).concat([{ role: 'user', content: text }, { role: 'assistant', content: agentOut.text }]);
       const merged = { ...(agentOut.session || session), history: newHistory };
       await saveSession(from, merged);
       return;
     }
 
-    // 2) Fallback: NLU básico
+    // 2) Fallback básico (keywords → stock)
     const qNorm = normalizeQuery(text, cfg.synonyms);
     const intent = detectIntent(qNorm, cfg.intents);
 
@@ -115,15 +119,16 @@ async function handleIncoming(ev) {
         const line = `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
         session.last_product = p.name;
         await saveSession(from, session);
-        if (p.image_url) await sendMedia(from, p.image_url, line);
+        const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
+        if (p.image_url && mode === 'rich') await sendMedia(from, p.image_url, line);
         else await sendText(from, line);
         return;
       }
-      await sendText(from, "¿Sobre qué producto querés consultar el stock? (ej.: bife, vacío, milanesa)");
+      await sendText(from, "¿Sobre qué producto o categoría querés consultar? (ej.: empanizado, bife, vacío, milanesa)");
       return;
     }
 
-    // 3) Saludo por defecto
+    // 3) Default
     const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
     await sendText(from, msg);
   } catch (err) {
