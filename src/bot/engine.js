@@ -35,6 +35,16 @@ function isGreeting(text = '') {
   return /^(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)\b/.test(t);
 }
 
+// quick toggles
+function isPhotoRequest(text = '') {
+  const t = (text || '').toLowerCase();
+  return /mostrame fotos|mandame fotos|mostrar fotos|ver fotos|con fotos|modo catálogo|modo catalogo|catálogo|catalogo/.test(t);
+}
+function isCatalogRequest(text = '') {
+  const t = (text || '').toLowerCase();
+  return /qué vendes|que vendes|catalogo|catálogo|ver productos|mostrame productos/.test(t);
+}
+
 // --------- extractores Evolution ---------
 function unwrap(ev) { return ev && ev.data ? ev.data : ev; }
 
@@ -59,10 +69,23 @@ function extractTextFromEvolution(ev) {
   return '';
 }
 
-// quick toggle “fotos”
-function isPhotoRequest(text) {
-  const t = (text || '').toLowerCase();
-  return /mostrame fotos|mandame fotos|mostrar fotos|ver fotos|con fotos|modo catálogo|modo catalogo|catálogo|catalogo/.test(t);
+// --------- helper: intentar responder desde stock directo ---------
+async function tryDirectStock(text, from, cfg, session, viewModeOverride) {
+  const items = await findProducts(text); // busca por nombre/variante/categorías
+  if (items && items.length) {
+    const p = items[0];
+    const line = `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
+    session.last_product = p.name;
+    await saveSession(from, session);
+    const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
+    if (p.image_url && mode === 'rich') {
+      await sendMedia(from, p.image_url, line);
+    } else {
+      await sendText(from, line);
+    }
+    return true;
+  }
+  return false;
 }
 
 // --------- handler ----------
@@ -75,25 +98,23 @@ async function handleIncoming(ev) {
     const cfg = await readBotConfig();
     const session = await getSession(from);
 
-    // Saludos: respondemos saludo “humano”
+    // 0) Saludos: respondemos “humano”
     if (isGreeting(text)) {
       const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
       await sendText(from, msg);
-      // guardo historia
       const newHistory = (session.history || []).concat([{ role: 'user', content: text }, { role: 'assistant', content: msg }]);
       await saveSession(from, { ...session, history: newHistory });
       return;
     }
 
-    const viewModeOverride = isPhotoRequest(text) ? 'rich' : null;
+    // 1) Overrides de visualización (one-shot)
+    const viewModeOverride = (isPhotoRequest(text) || isCatalogRequest(text)) ? 'rich' : null;
 
-    // Contexto para agente
+    // 2) Probar agente (OpenAI + tools) si está disponible
     const userCtx = {
       tz: cfg.timezone || 'America/Argentina/Cordoba',
       last_product: session.last_product || null
     };
-
-    // 1) Agente (OpenAI + tools)
     const agentOut = await runAgent({ userCtx, session, text, viewMode: viewModeOverride });
 
     if (agentOut && agentOut.text) {
@@ -108,7 +129,7 @@ async function handleIncoming(ev) {
       return;
     }
 
-    // 2) Fallback básico (keywords → stock)
+    // 3) Modo básico (keywords)
     const qNorm = normalizeQuery(text, cfg.synonyms);
     const intent = detectIntent(qNorm, cfg.intents);
 
@@ -124,11 +145,15 @@ async function handleIncoming(ev) {
         else await sendText(from, line);
         return;
       }
+      // nada por keywords -> pedimos precisión
       await sendText(from, "¿Sobre qué producto o categoría querés consultar? (ej.: empanizado, bife, vacío, milanesa)");
       return;
     }
 
-    // 3) Default
+    // 4) Refuerzo final: si no hubo intent, probá buscar directo en stock con el texto crudo
+    if (await tryDirectStock(text, from, cfg, session, viewModeOverride)) return;
+
+    // 5) Default: saludo/ayuda
     const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
     await sendText(from, msg);
   } catch (err) {
