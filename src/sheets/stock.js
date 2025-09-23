@@ -1,9 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const Papa = require('papaparse');
-const { google } = require('googleapis');
 const OpenAI = require('openai');
 const { logger } = require('../utils/logger');
+const { readBotConfig } = require('./config');
 
 const STOCK_PATH = path.join(process.cwd(), 'stock.csv');
 
@@ -11,9 +11,9 @@ function normalizeSearchText(q) {
   return (q || '')
     .toLowerCase()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quita acentos
-    .replace(/\b(tenes|tienes|quiero|quisiera|hay|mostrame|muestrame|mostrame|mostra|decime|necesito)\b/g, '')
+    .replace(/\b(tenes|tienes|quiero|quisiera|hay|mostrame|muestrame|mostra|decime|necesito)\b/g, '')
     .trim()
-    .replace(/s\b/, ''); // plurales simples → singular
+    .replace(/s\b/, ''); // plural simple → singular
 }
 
 // --- Leer stock CSV ---
@@ -55,14 +55,18 @@ async function findProducts(query, category) {
 
   if (results.length) return results;
 
-  // 2) Si no hubo resultados → usar IA para sugerir un alias/categoría
+  // 2) IA fallback: sugerir keyword si no hay resultados
   if (process.env.OPENAI_API_KEY) {
     try {
+      const cfg = await readBotConfig();
+      const parserPrompt = cfg.prompt_product_parser ||
+        "Sos un parser. Dado un texto del usuario, devolveme SOLO una palabra clave de producto o categoría de carnicería (ej.: asado, vacío, nalga, milanesa, pollo, cerdo, parrilla, empanizado). No inventes.";
+
       const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const aiRes = await client.chat.completions.create({
         model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
         messages: [
-          { role: "system", content: "Sos un parser. Dado un texto del usuario, devolveme SOLO una palabra clave de producto o categoría de carnicería. Ej: 'tenes algo para la parrilla?' → 'parrilla' o 'asado'." },
+          { role: "system", content: parserPrompt },
           { role: "user", content: query }
         ],
         temperature: 0.2,
