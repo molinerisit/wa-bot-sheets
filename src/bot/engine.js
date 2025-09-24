@@ -116,8 +116,7 @@ export async function handleIncoming({ channel, user_id, text }) {
         const found = match(text);
         if(found.length){
           const lines = found.map(r => '• ' + (r.name || r.titulo || r.descripcion || JSON.stringify(r)));
-          const msg = 'Resultados:
-' + lines.join('\n');
+         const msg = 'Resultados:\n' + lines.join('\n');
           await Message.create({ conversation_id: convo.id, role:'assistant', content: msg });
           return msg;
         }
