@@ -70,7 +70,7 @@ function extractTextFromEvolution(ev) {
 
 // --------- helper: intentar responder desde stock directo ---------
 async function tryDirectStock(text, from, cfg, session, viewModeOverride) {
-  const items = await findProducts(text);
+  const items = await findProducts(text); // busca por nombre/variante/categorías (con normalizador e IA fallback)
   if (items && items.length) {
     const p = items[0];
     const line = `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
@@ -97,8 +97,9 @@ async function handleIncoming(ev) {
     const cfg = await readBotConfig();
     const session = await getSession(from);
 
-    // 0) Saludos
-    if (isGreeting(text)) {
+    // 0) Saludos — si es SOLO saludo, corto; si es "hola + algo", saludo y SIGO
+    const onlyGreeting = /^[\s]*(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)[\s]*$/i.test(text || '');
+    if (onlyGreeting) {
       const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
       await sendText(from, msg);
       const newHistory = (session.history || []).concat([
@@ -108,11 +109,21 @@ async function handleIncoming(ev) {
       await saveSession(from, { ...session, history: newHistory });
       return;
     }
+    if (isGreeting(text)) {
+      const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
+      await sendText(from, msg);
+      const newHistory = (session.history || []).concat([
+        { role: 'user', content: text },
+        { role: 'assistant', content: msg }
+      ]);
+      await saveSession(from, { ...session, history: newHistory });
+      // NO return; continuamos con NLU/keywords
+    }
 
-    // 1) Overrides
+    // 1) Overrides de visualización (one-shot)
     const viewModeOverride = (isPhotoRequest(text) || isCatalogRequest(text)) ? 'rich' : null;
 
-    // 2) Probar agente (OpenAI + tools)
+    // 2) Agente (OpenAI + tools)
     const userCtx = {
       tz: cfg.timezone || 'America/Argentina/Cordoba',
       last_product: session.last_product || null
@@ -120,6 +131,7 @@ async function handleIncoming(ev) {
     const agentOut = await runAgent({ userCtx, session, text, viewMode: viewModeOverride });
 
     if (agentOut && agentOut.text) {
+      // Si devuelve "genérico", no cortamos: dejamos que siga al plan B
       const generic = /producto.*reserva.*ayudo/i.test(agentOut.text.toLowerCase());
       const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
 
@@ -134,10 +146,8 @@ async function handleIncoming(ev) {
         ]);
         const merged = { ...(agentOut.session || session), history: newHistory };
         await saveSession(from, merged);
-        return; // solo cortamos si NO es genérico
+        return; // solo corto si NO es genérico
       }
-
-      // si era genérico → seguimos al plan B
       logger.info({ text }, 'Respuesta genérica detectada, usando plan B');
     }
 
@@ -161,7 +171,7 @@ async function handleIncoming(ev) {
       return;
     }
 
-    // 4) Refuerzo final
+    // 4) Refuerzo final: búsqueda directa con el texto crudo
     if (await tryDirectStock(text, from, cfg, session, viewModeOverride)) return;
 
     // 5) Default
