@@ -31,10 +31,9 @@ function detectIntent(q, intents = []) {
 }
 
 function isGreeting(text = '') {
-  const t = text.toLowerCase().trim();
+  const t = (text || '').toLowerCase().trim();
   return /^(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)\b/.test(t);
 }
-
 function isPhotoRequest(text = '') {
   const t = (text || '').toLowerCase();
   return /mostrame fotos|mandame fotos|mostrar fotos|ver fotos|con fotos|modo catálogo|modo catalogo|catálogo|catalogo/.test(t);
@@ -43,8 +42,12 @@ function isCatalogRequest(text = '') {
   const t = (text || '').toLowerCase();
   return /qué vendes|que vendes|catalogo|catálogo|ver productos|mostrame productos/.test(t);
 }
+function isFollowUpQuestion(t='') {
+  const x = (t || '').toLowerCase().trim();
+  return /^(que cosa|qué cosa|cual|cuál|como es|cómo es|y cual|y cuál|cuales|cuáles)\b/.test(x);
+}
 
-// --------- extractores Evolution ---------
+// --------- extractores Evolution ----------
 function unwrap(ev) { return ev && ev.data ? ev.data : ev; }
 
 function extractFromNumber(ev) {
@@ -53,7 +56,14 @@ function extractFromNumber(ev) {
   if (typeof jid === 'string' && jid.includes('@')) return jid.split('@')[0];
   return typeof jid === 'string' ? jid : '';
 }
-
+function getMessageId(ev) {
+  const e = unwrap(ev);
+  return e?.key?.id || e?.data?.key?.id || e?.messageId || null;
+}
+function getRemoteJid(ev) {
+  const e = unwrap(ev);
+  return e?.key?.remoteJid || e?.from || e?.number || '';
+}
 function extractTextFromEvolution(ev) {
   const e = unwrap(ev);
   const m = e?.message;
@@ -68,11 +78,20 @@ function extractTextFromEvolution(ev) {
   return '';
 }
 
-// --------- helper: intentar responder desde stock directo ---------
+// --------- selección de “mejor” producto ----------
+function pickBestProduct(list=[]) {
+  const withStock = list.filter(p => (p.qty_available || 0) > 0);
+  if (withStock.length) {
+    return withStock.sort((a,b)=> (a.price||0)-(b.price||0))[0];
+  }
+  return list[0];
+}
+
+// --------- helper: intentar responder desde stock directo ----------
 async function tryDirectStock(text, from, cfg, session, viewModeOverride) {
-  const items = await findProducts(text); // búsqueda con normalizador + fuzzy + IA fallback
+  const items = await findProducts(text); // normalizador + fuzzy + IA fallback
   if (items && items.length) {
-    const p = items[0];
+    const p = pickBestProduct(items);
     const line = `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
     session.last_product = p.name;
     await saveSession(from, session);
@@ -90,35 +109,40 @@ async function tryDirectStock(text, from, cfg, session, viewModeOverride) {
 // --------- handler ----------
 async function handleIncoming(ev) {
   try {
-    const from = extractFromNumber(ev);
+    const msgId = getMessageId(ev);
+    const from = extractFromNumber(ev) || getRemoteJid(ev);
     const text = extractTextFromEvolution(ev);
     if (!from) { logger.warn({ ev }, 'Mensaje sin remitente (from)'); return; }
 
     const cfg = await readBotConfig();
     const session = await getSession(from);
 
+    // --- DEDUPE por message id ---
+    if (msgId) {
+      if (session.last_msg_id === msgId) {
+        logger.info({ from, msgId }, 'Duplicado ignorado');
+        return;
+      }
+      session.last_msg_id = msgId;
+      await saveSession(from, session);
+    }
+
     let greeted = false;
 
-    // 0) Saludos — si es SOLO saludo, corto; si es "hola + algo", saludo y SIGO
+    // 0) Saludos — SOLO si es saludo puro corto; si es “hola + algo”, saludo y SIGO
     const onlyGreeting = /^[\s]*(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)[\s]*$/i.test(text || '');
     if (onlyGreeting) {
       const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
       await sendText(from, msg);
-      const newHistory = (session.history || []).concat(
-        [{ role: 'user', content: text }, { role: 'assistant', content: msg }]
-      );
-      await saveSession(from, { ...session, history: newHistory });
+      await saveSession(from, { ...session, history: (session.history || []).concat([{ role:'user', content:text }, { role:'assistant', content:msg }]) });
       return;
     }
     if (isGreeting(text)) {
       const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
       await sendText(from, msg);
-      const newHistory = (session.history || []).concat(
-        [{ role: 'user', content: text }, { role: 'assistant', content: msg }]
-      );
-      await saveSession(from, { ...session, history: newHistory });
-      greeted = true; // importante
-      // NO return; continuamos con NLU/keywords
+      greeted = true;
+      await saveSession(from, { ...session, history: (session.history || []).concat([{ role:'user', content:text }, { role:'assistant', content:msg }]) });
+      // NO cortar
     }
 
     // 1) Overrides de visualización (one-shot)
@@ -146,9 +170,33 @@ async function handleIncoming(ev) {
         );
         const merged = { ...(agentOut.session || session), history: newHistory };
         await saveSession(from, merged);
-        return; // solo corto si NO es genérico
+        return; // corto si NO es genérico
       }
       logger.info({ text }, 'Respuesta genérica detectada, usando plan B');
+    }
+
+    // --- FOLLOW-UP con contexto (“¿qué cosa?” etc.) ---
+    if (isFollowUpQuestion(text)) {
+      const lp = session.last_product;
+      if (lp) {
+        const items = await findProducts(lp);
+        if (items && items.length) {
+          const best = pickBestProduct(items);
+          // alternativos: misma categoría si es posible
+          let alt = [];
+          try {
+            alt = (await findProducts('empanizado'))
+              .filter(x => x.name !== best.name && (x.qty_available || 0) > 0)
+              .slice(0, 2);
+          } catch {}
+          const altLine = alt.length ? ` También tengo: ${alt.map(a => `${a.name} $${a.price}`).join(', ')}.` : '';
+          const mainLine = `${best.name}${best.variant ? ` (${best.variant})` : ''} — $${best.price}${best.qty_available>0?` | Stock: ${best.qty_available}`:' | ahora sin stock'}.`;
+          await sendText(from, mainLine + altLine);
+          return;
+        }
+      }
+      await sendText(from, "¿De qué producto hablás? Ej.: milanesa, empanizado, bife, vacío.");
+      return;
     }
 
     // 3) Modo básico (keywords)
@@ -158,7 +206,7 @@ async function handleIncoming(ev) {
     if (intent === 'consulta_stock') {
       const items = await findProducts(qNorm);
       if (items && items.length) {
-        const p = items[0];
+        const p = pickBestProduct(items);
         const line = `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price} | Stock: ${p.qty_available}`;
         session.last_product = p.name;
         await saveSession(from, session);

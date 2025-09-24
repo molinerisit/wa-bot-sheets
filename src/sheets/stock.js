@@ -3,7 +3,7 @@ const path = require('path');
 const OpenAI = require('openai');
 const { logger } = require('../utils/logger');
 const { readBotConfig } = require('./config');
-const { getSheets } = require('./sheets');
+const { getSheets } = require('./sheets'); // helper existente para Google Sheets
 
 // rutas posibles a CSV
 function candidateCsvPaths() {
@@ -15,7 +15,7 @@ function candidateCsvPaths() {
 }
 
 function normalize(t='') {
-  return t.toLowerCase()
+  return (t || '').toLowerCase()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/\b(tenes|tienes|quiero|quisiera|hay|mostrame|muestrame|mostra|decime|necesito|me|para|la|el|de|unas|unos|un|una)\b/g, ' ')
     .replace(/\s+/g, ' ')
@@ -39,7 +39,6 @@ function lev(a='', b='') {
   return dp[m][n];
 }
 function fuzzyHit(q, text) {
-  // divide el texto en tokens y permite distancia <= 2
   const tokens = (text || '').split(/[^a-z0-9áéíóúüñ]+/i).filter(Boolean).map(x=>normalize(x));
   const qn = normalize(q);
   if (!qn) return false;
@@ -131,6 +130,15 @@ async function readStock() {
   return [];
 }
 
+function prioritize(list=[]) {
+  return [...list].sort((a, b) => {
+    const sa = (a.qty_available || 0) > 0 ? 0 : 1;
+    const sb = (b.qty_available || 0) > 0 ? 0 : 1;
+    if (sa !== sb) return sa - sb;       // primero con stock
+    return (a.price || 0) - (b.price || 0); // luego por precio asc
+  });
+}
+
 // ---------- Buscador ----------
 async function findProducts(query, category) {
   const qNorm = normalize(query);
@@ -146,8 +154,7 @@ async function findProducts(query, category) {
     const catHit = catNorm && cats.includes(catNorm);
     return nameHit || catHit;
   });
-
-  if (results.length) return results;
+  if (results.length) return prioritize(results);
 
   // 2) Fuzzy (para typos tipo "milaneas")
   results = stock.filter(p => {
@@ -158,15 +165,16 @@ async function findProducts(query, category) {
   });
   if (results.length) {
     logger.info({ query, hits: results.length }, 'Fuzzy match encontró resultados');
-    return results;
+    return prioritize(results);
   }
 
-  // 3) IA keyword fallback
+  // 3) IA keyword fallback con prompt desde config.csv
   if (process.env.OPENAI_API_KEY) {
     try {
       const cfg = await readBotConfig();
       const parserPrompt = cfg.prompt_product_parser ||
         "Sos un parser. Dado un texto del usuario, devolveme SOLO una palabra clave de producto o categoría de carnicería (ej.: asado, vacío, nalga, milanesa, pollo, cerdo, parrilla, empanizado). No inventes.";
+
       const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const aiRes = await client.chat.completions.create({
         model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
@@ -186,13 +194,14 @@ async function findProducts(query, category) {
           const cats = normalize(p.categories || '');
           return name.includes(keyword) || variant.includes(keyword) || cats.includes(keyword);
         });
+        if (results.length) return prioritize(results);
       }
     } catch (e) {
       logger.warn({ e }, 'IA keyword fallback failed');
     }
   }
 
-  return results;
+  return [];
 }
 
 module.exports = { readStock, findProducts };
