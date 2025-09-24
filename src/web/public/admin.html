@@ -1,0 +1,125 @@
+
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Admin Bot – Config</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell; margin: 24px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-bottom: 20px; box-shadow: 0 2px 6px rgba(0,0,0,.04); }
+    input, textarea, select, button { padding: 10px; border-radius: 8px; border: 1px solid #ccc; width: 100%; box-sizing: border-box; }
+    label { font-size: 12px; color: #555; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .actions { display:flex; gap:10px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align:left; padding:8px; border-bottom:1px solid #eee; }
+    .kv { display:grid; grid-template-columns: 220px 1fr; gap:10px; align-items:center; margin-bottom:10px; }
+    .pill { display:inline-block; padding:4px 8px; background:#eef; border-radius:999px; font-size:12px; }
+    .muted { color:#666; font-size:13px; }
+  </style>
+</head>
+<body>
+  <h1>Admin del Bot</h1>
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>ADMIN_TOKEN</label>
+        <input id="token" placeholder="pegá tu token aquí" />
+      </div>
+      <div class="actions" style="align-items:flex-end;">
+        <button onclick="loadAll()">Cargar Config</button>
+        <button onclick="saveConfig()">Guardar</button>
+      </div>
+    </div>
+    <p class="muted">Las llamadas a /config y /admin requieren header <code>x-admin-token</code> con este valor.</p>
+  </div>
+
+  <div class="card">
+    <h2>Configuración</h2>
+    <div id="configArea"></div>
+  </div>
+
+  <div class="card">
+    <h2>Productos <span class="pill" id="prodCount">0</span></h2>
+    <div class="actions">
+      <button onclick="loadProducts()">Recargar</button>
+      <button onclick="seedDemo()">Seed Demo (si vacía)</button>
+    </div>
+    <table>
+      <thead><tr><th>SKU</th><th>Nombre</th><th>Precio</th><th>Stock</th><th>Categoría</th></tr></thead>
+      <tbody id="prodBody"></tbody>
+    </table>
+  </div>
+
+<script>
+const $ = sel => document.querySelector(sel);
+const headers = () => ({ 'Content-Type':'application/json', 'x-admin-token': $('#token').value.trim() });
+
+async function loadAll(){
+  await loadConfig();
+  await loadProducts();
+}
+
+async function loadConfig(){
+  const res = await fetch('/config', { headers: headers() });
+  if(!res.ok){ alert('Error config: '+res.status); return; }
+  const data = await res.json();
+  const cfg = data.config || {};
+  const keys = [
+    'bot_name','language','timezone',
+    'greeting_template','oos_template',
+    'ecommerce_url','response_mode','agent_role','business_hours'
+  ];
+  const area = $('#configArea');
+  area.innerHTML = '';
+  keys.forEach(k=>{
+    const val = cfg[k] ?? '';
+    const row = document.createElement('div');
+    row.className = 'kv';
+    const label = document.createElement('label'); label.textContent = k;
+    const input = (k.endsWith('_template') || k==='business_hours') ? document.createElement('textarea') : document.createElement('input');
+    input.value = val;
+    input.id = 'cfg_'+k;
+    row.appendChild(label); row.appendChild(input);
+    area.appendChild(row);
+  });
+}
+
+async function saveConfig(){
+  const body = {};
+  document.querySelectorAll('#configArea [id^=cfg_]').forEach(el=>{
+    const key = el.id.replace('cfg_','');
+    body[key] = el.value;
+  });
+  const res = await fetch('/config', { method:'POST', headers: headers(), body: JSON.stringify(body) });
+  if(!res.ok){ alert('Error guardando: '+res.status); return; }
+  alert('Guardado');
+}
+
+async function loadProducts(){
+  const res = await fetch('/admin/products', { headers: headers() });
+  if(!res.ok){ alert('Error productos: '+res.status); return; }
+  const data = await res.json();
+  $('#prodCount').textContent = data.length;
+  const tbody = $('#prodBody'); tbody.innerHTML = '';
+  data.forEach(p=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${p.sku}</td><td>${p.name}</td><td>${p.price}</td><td>${p.stock}</td><td>${p.category||''}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function seedDemo(){
+  // ejemplo rápido: crear un producto si no hay
+  const res = await fetch('/admin/products', {
+    method:'POST',
+    headers: headers(),
+    body: JSON.stringify({ sku:'DEMO-'+Date.now(), name:'Producto Demo', price:1000, stock:5, category:'Demo' })
+  });
+  if(!res.ok){ alert('Error seed: '+res.status); return; }
+  loadProducts();
+}
+</script>
+</body>
+</html>

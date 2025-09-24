@@ -1,352 +1,147 @@
-/**
- * engine.js
- * Orquestador principal: recibe el webhook, deduplica eventos,
- * saluda si corresponde, llama al agente NLU (OpenAI) y/o
- * cae al plan B de keywords + búsqueda en stock.
- *
- * Cambios clave:
- * - Dedupe por messageId (evita dobles respuestas/saludos).
- * - Saludo "puro" corta; "hola + pedido" saluda y sigue.
- * - Respuestas de producto SIN "Stock: N" por defecto (solo precio).
- * - Prioriza "Milanesa especial" si la consulta es "milanesa(s)" (aunque no haya stock).
- * - Si no hay stock, sugiere alternativas con stock.
- * - Follow-up con contexto ("¿qué cosa?") usando session.last_product.
- * - Si el agente devuelve respuesta genérica, NO cortamos (se usa plan B).
- */
 
-const Mustache = require('mustache');
-const { readBotConfig } = require('../sheets/config');
-const { findProducts } = require('../sheets/stock');
-const { sendText, sendMedia } = require('../evo');
-const { logger } = require('../utils/logger');
-const { getSession, saveSession } = require('../memory/store');
-const { runAgent } = require('../nlu/agent');
+import dayjs from 'dayjs';
+import { z } from 'zod';
+import OpenAI from 'openai';
+import { BotConfig, Conversation, Message } from '../sql/models/index.js';
+import { detectIntent, normalizeText } from './nlu.js';
+import { applyRules, listProducts } from './shop.js';
+import { renderTemplate } from './nlg.js';
+import { searchRag } from '../rag/service.js';
+import { sequelize } from '../sql/db.js';
 
-// ===================== Utils de NLU local (plan B) =====================
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-function normalizeQuery(q, synonyms = {}) {
-  // Reemplaza sinónimos por su forma canónica (ej. "milaneas" -> "milanesa")
-  const raw = (typeof q === 'string' ? q : '').toLowerCase();
-  let out = raw;
-  for (const [canon, syns] of Object.entries(synonyms || {})) {
-    for (const s of syns || []) {
-      const from = String(s).toLowerCase();
-      const to = String(canon).toLowerCase();
-      if (from) out = out.replaceAll(from, to);
-    }
-  }
-  return out;
+const ExtractSchema = z.object({
+  action: z.enum(['smalltalk','search_product','buy','hours','unknown','qa']).default('qa'),
+  product_query: z.string().optional(),
+  quantity: z.number().int().positive().optional()
+});
+
+function buildRagSystemPrompt(botName='Bot'){
+  return [
+    `Sos ${botName}. RESPONDÉ SOLO con información presente en los fragmentos proporcionados (RAG).`,
+    `Si la respuesta no está en los fragmentos, decí: "No tengo esa información cargada aún." (no inventes).`,
+    `Sé conciso. Idioma: español de Argentina.`
+  ].join('\n');
 }
 
-function detectIntent(q, intents = []) {
-  // Intent matcher muy simple basado en "includes"
-  const t = (typeof q === 'string' ? q : '').toLowerCase();
-  for (const it of intents || []) {
-    for (const ex of (it.examples || [])) {
-      if (t.includes(String(ex).toLowerCase())) return it.name;
-    }
-  }
-  return 'fallback';
-}
+export async function handleIncoming({ channel, user_id, text }) {
+  const cfgRows = await BotConfig.findAll();
+  const cfg = Object.fromEntries(cfgRows.map(r=>[r.key, r.value]));
+  const maxTurns = Number(process.env.BOT_MAX_TURNS || 6);
+  const botName = cfg.bot_name || 'Bot';
 
-function isGreeting(text = '') {
-  const t = text.toLowerCase().trim();
-  return /^(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)\b/.test(t);
-}
+  let convo = await Conversation.findOne({ where: { channel, user_id }});
+  if(!convo) convo = await Conversation.create({ channel, user_id, state: {} });
 
-function isPhotoRequest(text = '') {
-  const t = (text || '').toLowerCase();
-  return /mostrame fotos|mandame fotos|mostrar fotos|ver fotos|con fotos|modo catálogo|modo catalogo|catálogo|catalogo/.test(t);
-}
+  await Message.create({ conversation_id: convo.id, role:'user', content: text });
 
-function isCatalogRequest(text = '') {
-  const t = (text || '').toLowerCase();
-  return /qué vendes|que vendes|catalogo|catálogo|ver productos|mostrame productos/.test(t);
-}
-
-function isFollowUpQuestion(t = '') {
-  // Follow-ups cortos sin contexto explícito
-  const x = (t || '').toLowerCase().trim();
-  return /^(que cosa|qué cosa|cual|cuál|como es|cómo es|y cual|y cuál|cuales|cuáles)\b/.test(x);
-}
-
-// ===================== Extractores Evolution (robustos) =====================
-
-function unwrap(ev) { return ev && ev.data ? ev.data : ev; }
-
-function extractFromNumber(ev) {
-  const e = unwrap(ev);
-  const jid = e?.key?.remoteJid || e?.from || e?.number || '';
-  if (typeof jid === 'string' && jid.includes('@')) return jid.split('@')[0];
-  return typeof jid === 'string' ? jid : '';
-}
-
-function getMessageId(ev) {
-  const e = unwrap(ev);
-  return e?.key?.id || e?.data?.key?.id || e?.messageId || null;
-}
-
-function getRemoteJid(ev) {
-  const e = unwrap(ev);
-  return e?.key?.remoteJid || e?.from || e?.number || '';
-}
-
-function extractTextFromEvolution(ev) {
-  // Toma texto desde todas las variantes posibles de Evolution
-  const e = unwrap(ev);
-  const m = e?.message;
-  if (typeof e?.text === 'string') return e.text;
-  if (typeof m === 'string') return m;
-  if (m?.conversation) return m.conversation;
-  if (m?.extendedTextMessage?.text) return m.extendedTextMessage.text;
-  if (m?.imageMessage?.caption) return m.imageMessage.caption;
-  if (m?.videoMessage?.caption) return m.videoMessage.caption;
-  if (m?.documentMessage?.caption) return m.documentMessage.caption;
-  if (e?.message?.text?.body) return e.message.text.body;
-  return '';
-}
-
-// ===================== Formateo y selección de producto =====================
-
-/**
- * Devuelve la línea de producto para enviar al usuario.
- * Por defecto: SOLO precio (sin "Stock: N"). Si no hay stock, lo marca entre paréntesis.
- */
-function productLine(p, cfg, { includeStock = false, markOOS = true } = {}) {
-  const base = `${p.name}${p.variant ? ` (${p.variant})` : ''} — $${p.price}`;
-  if (!includeStock) {
-    if (markOOS && (p.qty_available || 0) <= 0) return base + ' (ahora sin stock)';
-    return base;
-  }
-  const stock = ` | Stock: ${p.qty_available}`;
-  if (markOOS && (p.qty_available || 0) <= 0) return base + ' | ahora sin stock';
-  return base + stock;
-}
-
-/**
- * pickBestProduct:
- * - Si la query menciona "milanesa(s)", prioriza "Milanesa especial" (aunque esté sin stock).
- * - Si no, prioriza con stock y luego menor precio.
- */
-function pickBestProduct(list = [], { query = '' } = {}) {
-  if (!list.length) return null;
-  const q = (query || '').toLowerCase();
-
-  const norm = s => (s || '').toLowerCase();
-  const byName = (name, word) => norm(name).includes(norm(word));
-
-  // Regla específica: milanesa(s) => preferir "especial"
-  if (/\bmilanesa(s)?\b/i.test(q)) {
-    const milas = list.filter(p => byName(p.name, 'milanesa'));
-    if (milas.length) {
-      const especial = milas.find(p => byName(p.name, 'especial'));
-      if (especial) return especial;
-      return milas[0];
-    }
+  const turnCount = await Message.count({ where: { conversation_id: convo.id } });
+  if (turnCount > maxTurns*2) {
+    const oos = cfg.oos_template || 'No entendí. ¿Querés intentar de nuevo?';
+    await Message.create({ conversation_id: convo.id, role:'assistant', content: oos });
+    return oos;
   }
 
-  // General: primero con stock (precio más bajo)
-  const withStock = list.filter(p => (p.qty_available || 0) > 0);
-  if (withStock.length) {
-    return withStock.sort((a, b) => (a.price || 0) - (b.price || 0))[0];
-  }
-  return list[0];
-}
+  const normalized = normalizeText(text);
 
-// ===================== Helper: búsqueda directa en stock =====================
-
-async function tryDirectStock(text, from, cfg, session, viewModeOverride) {
-  // findProducts ya incluye normalizador + fuzzy + IA fallback
-  const items = await findProducts(text);
-  if (items && items.length) {
-    const p = pickBestProduct(items, { query: text });
-    const line = productLine(p, cfg, { includeStock: false }); // <<< sin "Stock: N"
-    session.last_product = p.name;
-    await saveSession(from, session);
-
-    const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
-    if (p.image_url && mode === 'rich') {
-      await sendMedia(from, p.image_url, line);
-    } else {
-      await sendText(from, line);
-    }
-
-    // Si no hay stock, ofrecer alternativas (misma familia si aplica)
-    if ((p.qty_available || 0) <= 0) {
-      try {
-        const alt = (await findProducts('empanizado'))
-          .filter(x => x.name !== p.name && (x.qty_available || 0) > 0)
-          .slice(0, 2);
-        if (alt.length) {
-          const altLine = alt
-            .map(a => productLine(a, cfg, { includeStock: false, markOOS: false }))
-            .join(' | ');
-          await sendText(from, `También tengo: ${altLine}.`);
-        }
-      } catch (e) {
-        logger.warn({ e }, 'Alternatives suggestion failed');
-      }
-    }
-    return true;
-  }
-  return false;
-}
-
-// ===================== Handler principal =====================
-
-async function handleIncoming(ev) {
+  // 1) Intent + LLM extract (pero la política por defecto es QA sobre RAG)
+  let intent = await detectIntent(normalized);
+  let llmExtract = { action: intent || 'qa' };
   try {
-    // Identificación y extracción robusta
-    const msgId = getMessageId(ev);
-    const from = extractFromNumber(ev) || getRemoteJid(ev);
-    const text = extractTextFromEvolution(ev);
-    if (!from) { logger.warn({ ev }, 'Mensaje sin remitente (from)'); return; }
+    const sys = 'Sos un parser. Devolvé exclusivamente JSON con las keys: action, product_query, quantity. action en {smalltalk,search_product,buy,hours,unknown,qa}.';
+    const user = 'Texto: """' + text + '"""';
+    const resp = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{role:'system', content:sys},{role:'user', content:user}],
+      temperature: 0
+    });
+    const raw = resp.choices[0].message?.content || '{}';
+    const jsonStart = raw.indexOf('{');
+    const jsonEnd = raw.lastIndexOf('}');
+    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd+1));
+    llmExtract = ExtractSchema.parse(parsed);
+  } catch(e){ /* fallback */ }
 
-    const cfg = await readBotConfig();
-    const session = await getSession(from);
+  const action = llmExtract.action || 'qa';
 
-    // --- 0) DEDUPE por message id ---
-    if (msgId) {
-      if (session.last_msg_id === msgId) {
-        logger.info({ from, msgId }, 'Duplicado ignorado');
-        return;
-      }
-      session.last_msg_id = msgId;
-      await saveSession(from, session);
-    }
-
-    let greeted = false;
-
-    // --- 1) Saludo "puro" corta; "hola + algo" saluda y sigue ---
-    const onlyGreeting = /^[\s]*(hola|buenas|buen día|buen dia|buenas tardes|buenas noches|qué tal|que tal)[\s]*$/i.test(text || '');
-    if (onlyGreeting) {
-      const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
-      await sendText(from, msg);
-      await saveSession(from, {
-        ...session,
-        history: (session.history || []).concat([{ role: 'user', content: text }, { role: 'assistant', content: msg }])
-      });
-      return;
-    }
-    if (isGreeting(text)) {
-      const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
-      await sendText(from, msg);
-      greeted = true; // marcamos que ya saludamos en ESTE turno
-      await saveSession(from, {
-        ...session,
-        history: (session.history || []).concat([{ role: 'user', content: text }, { role: 'assistant', content: msg }])
-      });
-      // NO cortamos: dejamos seguir a NLU/keywords
-    }
-
-    // --- 2) Overrides de visualización: si piden catálogo/fotos, forzamos 'rich' ---
-    const viewModeOverride = (isPhotoRequest(text) || isCatalogRequest(text)) ? 'rich' : null;
-
-    // --- 3) Agente (OpenAI + tools) ---
-    const userCtx = {
-      tz: cfg.timezone || 'America/Argentina/Cordoba',
-      last_product: session.last_product || null
-    };
-    const agentOut = await runAgent({ userCtx, session, text, viewMode: viewModeOverride });
-
-    if (agentOut && agentOut.text) {
-      // Si el agente responde "genérico", NO cortamos: usamos plan B
-      const generic = /producto.*reserva.*ayudo/i.test(agentOut.text.toLowerCase());
-      const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
-
-      if (!generic) {
-        await sendText(from, agentOut.text);
-        if (mode === 'rich' && agentOut.rich?.image_url) {
-          await sendMedia(from, agentOut.rich.image_url, agentOut.rich.caption || '');
-        }
-        const newHistory = (session.history || []).concat([
-          { role: 'user', content: text },
-          { role: 'assistant', content: agentOut.text }
-        ]);
-        const merged = { ...(agentOut.session || session), history: newHistory };
-        await saveSession(from, merged);
-        return; // solo cortamos si NO es genérico
-      }
-      logger.info({ text }, 'Respuesta genérica detectada por agente; se usa plan B');
-    }
-
-    // --- 4) Follow-up con contexto ("¿qué cosa?") ---
-    if (isFollowUpQuestion(text)) {
-      const lp = session.last_product;
-      if (lp) {
-        const items = await findProducts(lp);
-        if (items && items.length) {
-          const best = pickBestProduct(items, { query: lp });
-          let msg = productLine(best, cfg, { includeStock: false });
-          if ((best.qty_available || 0) <= 0) {
-            const alt = (await findProducts('empanizado'))
-              .filter(x => x.name !== best.name && (x.qty_available || 0) > 0)
-              .slice(0, 2);
-            if (alt.length) {
-              msg += ` | Alternativas: ${alt
-                .map(a => productLine(a, cfg, { includeStock: false, markOOS: false }))
-                .join(' | ')}`;
-            }
-          }
-          await sendText(from, msg);
-          return;
-        }
-      }
-      await sendText(from, "¿De qué producto hablás? Ej.: milanesa, empanizado, bife, vacío.");
-      return;
-    }
-
-    // --- 5) Plan B (keywords/config) ---
-    const qNorm = normalizeQuery(text, cfg.synonyms);
-    const intent = detectIntent(qNorm, cfg.intents);
-
-    if (intent === 'consulta_stock') {
-      const items = await findProducts(qNorm);
-      if (items && items.length) {
-        const p = pickBestProduct(items, { query: qNorm });
-        const line = productLine(p, cfg, { includeStock: false }); // <<< sin "Stock: N"
-        session.last_product = p.name;
-        await saveSession(from, session);
-        const mode = (viewModeOverride || cfg.response_mode || 'concise').toLowerCase();
-        if (p.image_url && mode === 'rich') await sendMedia(from, p.image_url, line);
-        else await sendText(from, line);
-
-        // Sugerir alternativas si el elegido está sin stock
-        if ((p.qty_available || 0) <= 0) {
-          try {
-            const alt = (await findProducts('empanizado'))
-              .filter(x => x.name !== p.name && (x.qty_available || 0) > 0)
-              .slice(0, 2);
-            if (alt.length) {
-              const altLine = alt
-                .map(a => productLine(a, cfg, { includeStock: false, markOOS: false }))
-                .join(' | ');
-              await sendText(from, `También tengo: ${altLine}.`);
-            }
-          } catch (e) {
-            logger.warn({ e }, 'Alternatives suggestion failed (plan B)');
-          }
-        }
-        return;
-      }
-      // No se encontró nada por keywords → pedimos precisión
-      await sendText(from, "¿Sobre qué producto o categoría querés consultar? (ej.: empanizado, bife, vacío, milanesa)");
-      return;
-    }
-
-    // --- 6) Refuerzo final: búsqueda directa con el texto crudo ---
-    if (await tryDirectStock(text, from, cfg, session, viewModeOverride)) return;
-
-    // --- 7) Default: si ya saludamos en este turno, no re-saludar ---
-    if (!greeted) {
-      const msg = Mustache.render(cfg.greeting_template || 'Hola', { bot_name: cfg.bot_name || 'Bot' });
-      await sendText(from, msg);
-    } else {
-      await sendText(from, "Decime el producto o categoría (ej.: empanizado, bife, vacío, milanesa).");
-    }
-  } catch (err) {
-    logger.error({ err, ev }, 'engine.handleIncoming error');
+  // 2) Si es smalltalk u hours, responder sin RAG
+  if (action === 'smalltalk') {
+    const out = renderTemplate(cfg.greeting_template || 'Hola, soy {{bot_name}}. ¿En qué ayudo?', { bot_name: botName, greeting: '¡Hola!' });
+    await Message.create({ conversation_id: convo.id, role:'assistant', content: out });
+    return out;
   }
+  if (action === 'hours') {
+    const msg = 'Nuestro horario: lun-vie 09:00–19:00, sáb 09:00–13:00 (GMT-3).';
+    await Message.create({ conversation_id: convo.id, role:'assistant', content: msg });
+    return msg;
+  }
+
+  // 3) RAG FIRST (QA estricto)
+  const snippets = await searchRag(text, 6);
+  const context = snippets.map((s,i)=>`[${i+1}] ${s.text}`).join('\n\n');
+  const sysRag = buildRagSystemPrompt(botName);
+  let ragAnswer = '';
+  try{
+    const comp = await client.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      messages: [
+        { role:'system', content: sysRag },
+        { role:'user', content: `Consulta: ${text}\n\nFragmentos (RAG):\n${context}` }
+      ]
+    });
+    ragAnswer = comp.choices[0].message?.content?.trim() || '';
+  }catch(e){ ragAnswer = ''; }
+
+  if (ragAnswer && !/no tengo esa informaci/i.test(ragAnswer)) {
+    await Message.create({ conversation_id: convo.id, role:'assistant', content: ragAnswer });
+    return ragAnswer;
+  }
+
+  // 4) Accionamiento ecommerce/agenda (solo vía DB externa con SQL whitelisteado)
+  if (action === 'search_product' || action === 'buy') {
+    // Si definiste external_db_url + allowed_sql, usamos eso
+    const externalUrl = cfg.external_db_url;
+    const allow = safeParseJSON(cfg.external_allowed_sql) || [];
+    if (externalUrl && allow.length){
+      // Pequeño ejecutor de queries permitidos (solo SELECT) hacia una segunda conexión
+      const { Sequelize } = await import('sequelize');
+      const ext = new Sequelize(externalUrl, { dialect:'postgres', logging:false });
+      // tomar primera consulta whitelisted como catálogo
+      const sql = String(allow[0]||'').toLowerCase().startsWith('select') ? allow[0] : null;
+      if(sql){
+        const [rows] = await ext.query(sql);
+        const match = (q) => rows.filter(r => JSON.stringify(r).toLowerCase().includes(q.toLowerCase())).slice(0,8);
+        const found = match(text);
+        if(found.length){
+          const lines = found.map(r => '• ' + (r.name || r.titulo || r.descripcion || JSON.stringify(r)));
+          const msg = 'Resultados:
+' + lines.join('\n');
+          await Message.create({ conversation_id: convo.id, role:'assistant', content: msg });
+          return msg;
+        }
+      }
+      // fallback si no hay o no coincide
+    } else {
+      // Uso del catálogo simulado interno (shop.*) si no hay DB externa configurada
+      const items = await listProducts(text);
+      const adjusted = await applyRules(items, {});
+      if (adjusted.length){
+        const lines = adjusted.slice(0,8).map(p=>`• ${p.name} (${p.sku}) — $${p.price}${p._discount?` (-${p._discount}%)`:''}`);
+        const msg = `Encontré ${adjusted.length} resultado(s):\n` + lines.join('\n');
+        await Message.create({ conversation_id: convo.id, role:'assistant', content: msg });
+        return msg;
+      }
+    }
+  }
+
+  // 5) Si RAG no alcanzó y no hay acción clara
+  const fallback = cfg.oos_template || 'No tengo esa información cargada aún.';
+  await Message.create({ conversation_id: convo.id, role:'assistant', content: fallback });
+  return fallback;
 }
 
-module.exports = { handleIncoming };
+function safeParseJSON(v){
+  try{ return JSON.parse(v); }catch(_){ return null; }
+}
